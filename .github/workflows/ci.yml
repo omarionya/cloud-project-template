@@ -1,0 +1,26 @@
+name: ci
+on:
+  pull_request:
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { env: [dev, prod] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: terraform-linters/setup-tflint@v4
+      - run: terraform fmt -check -recursive
+      - run: tflint --recursive
+      - uses: bridgecrewio/checkov-action@v12
+        with: { directory: ., quiet: true }
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: terraform -chdir=envs/${{ matrix.env }} init
+      - run: terraform -chdir=envs/${{ matrix.env }} plan -no-color -out=tfplan

@@ -1,0 +1,122 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "envs/**"
+      - "modules/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # lets the job request the OIDC token
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  deploy-dev:
+    name: deploy dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: dev
+    concurrency:
+      group: terraform-dev
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: envs/dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.11" # keep in sync with versions.tf
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-dev-${{ github.run_id }}
+
+      - name: Verify target account
+        run: |
+          actual=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$actual" != "${{ vars.AWS_ACCOUNT_ID }}" ]; then
+            echo "Wrong account: got $actual, expected ${{ vars.AWS_ACCOUNT_ID }}"
+            exit 1
+          fi
+
+      - name: Terraform init
+        run: terraform init -lock-timeout=5m
+
+      - name: Terraform plan
+        run: terraform plan -lock-timeout=5m -no-color -out=tfplan
+
+      - name: Show plan in job summary
+        run: |
+          {
+            echo "### Plan: dev"
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        run: terraform apply -lock-timeout=5m tfplan
+
+  deploy-prod:
+    name: deploy prod
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: prod # required reviewers pause the job here
+    concurrency:
+      group: terraform-prod
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: envs/prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.11"
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-prod-${{ github.run_id }}
+
+      - name: Verify target account
+        run: |
+          actual=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$actual" != "${{ vars.AWS_ACCOUNT_ID }}" ]; then
+            echo "Wrong account: got $actual, expected ${{ vars.AWS_ACCOUNT_ID }}"
+            exit 1
+          fi
+
+      - name: Terraform init
+        run: terraform init -lock-timeout=5m
+
+      - name: Terraform plan
+        run: terraform plan -lock-timeout=5m -no-color -out=tfplan
+
+      - name: Show plan in job summary
+        run: |
+          {
+            echo "### Plan: prod"
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        run: terraform apply -lock-timeout=5m tfplan

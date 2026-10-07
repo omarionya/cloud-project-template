@@ -1,0 +1,100 @@
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to destroy
+        type: choice
+        options: [dev, prod]
+        required: true
+      confirm:
+        description: 'Type "destroy-dev" or "destroy-prod" to confirm'
+        type: string
+        required: true
+      targets:
+        description: Optional space-separated resource addresses (empty means destroy everything)
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  destroy:
+    name: destroy ${{ inputs.environment }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }} # prod reviewers approve here
+    concurrency:
+      group: terraform-${{ inputs.environment }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: envs/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check confirmation and inputs
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          ENV_NAME: ${{ inputs.environment }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          if [ "$CONFIRM" != "destroy-$ENV_NAME" ]; then
+            echo "Confirmation text does not match destroy-$ENV_NAME"
+            exit 1
+          fi
+          if [ -n "$TARGETS" ] && ! printf '%s' "$TARGETS" | grep -Eq '^[]A-Za-z0-9_.[" -]+$'; then
+            echo "Targets contain unexpected characters"
+            exit 1
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.11"
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-destroy-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: Verify target account
+        run: |
+          actual=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$actual" != "${{ vars.AWS_ACCOUNT_ID }}" ]; then
+            echo "Wrong account: got $actual, expected ${{ vars.AWS_ACCOUNT_ID }}"
+            exit 1
+          fi
+
+      - name: Terraform init
+        run: terraform init -lock-timeout=5m
+
+      - name: Terraform plan -destroy
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          args=()
+          for t in $TARGETS; do args+=("-target=$t"); done
+          terraform plan -destroy -lock-timeout=5m -no-color -out=tfplan "${args[@]}"
+
+      - name: Show destroy plan in job summary
+        run: |
+          {
+            echo "### Destroy plan: ${{ inputs.environment }}"
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply (destroy)
+        run: terraform apply -lock-timeout=5m tfplan
