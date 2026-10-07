@@ -1,16 +1,83 @@
 name: oidc_check
+
+# Tests that GitHub can assume the AWS plan and apply roles through OIDC.
+# - plan-role job: runs on pull requests and manual runs
+# - apply-role job: manual runs only, goes through the GitHub Environment
+
 on:
-  workflow_dispatch:
   pull_request:
+    paths:
+      - ".github/workflows/oidc_check.yml"
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment to test"
+        type: choice
+        options: [dev, prod]
+        default: dev
+      show_claims:
+        description: "Print the non-secret OIDC token claims (debug)"
+        type: boolean
+        default: false
+
 permissions:
-  id-token: write
+  id-token: write # required to request the OIDC token
   contents: read
+
+env:
+  TARGET_ENV: ${{ inputs.env || 'dev' }}
+
 jobs:
-  check:
+  plan-role:
+    name: assume plan role
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Show OIDC claims (debug)
+        if: inputs.show_claims == true
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          echo "::add-mask::$TOKEN"
+          echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null \
+            | jq '{sub, aud, iss, repository, ref, environment, event_name}'
+
+      - name: Assume plan role
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.DEV_PLAN_ROLE_ARN }}
+          role-to-assume: ${{ env.TARGET_ENV == 'dev' && vars.DEV_PLAN_ROLE_ARN || vars.PROD_PLAN_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-      - run: aws sts get-caller-identity
+          role-session-name: oidc-check-plan-${{ github.run_id }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: Check state bucket is reachable
+        if: vars.STATE_BUCKET_NAME != ''
+        run: aws s3api head-bucket --bucket "${{ vars.STATE_BUCKET_NAME }}" && echo "State bucket reachable"
+
+  apply-role:
+    name: assume apply role
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ${{ inputs.env }} # APPLY_ROLE_ARN and AWS_ACCOUNT_ID come from this Environment
+    steps:
+      - name: Assume apply role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: oidc-check-apply-${{ github.run_id }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: Verify target account
+        run: |
+          actual=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$actual" != "${{ vars.AWS_ACCOUNT_ID }}" ]; then
+            echo "Wrong account: got $actual, expected ${{ vars.AWS_ACCOUNT_ID }}"
+            exit 1
+          fi
+          echo "Account matches: $actual"
